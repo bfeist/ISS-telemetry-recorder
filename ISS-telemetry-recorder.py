@@ -8,6 +8,13 @@ from lightstreamer.client import (
     ClientListener,
 )
 
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=".env")
+RAW_FOLDER = os.getenv("RAW_FOLDER")
+
+output_folder = os.path.join(RAW_FOLDER, "iss_telemetry")
+
 
 # Create logs directory if it doesn't exist
 def ensure_logs_directory():
@@ -17,23 +24,54 @@ def ensure_logs_directory():
     return logs_dir
 
 
+# Create output directory if it doesn't exist
+def ensure_output_directory():
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    return output_folder
+
+
 # Timestamp for log messages
 def get_log_timestamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# Helper function to get date-based directory path
+def get_date_directory():
+    # Create date-based directory structure using UTC date
+    utc_now = datetime.datetime.utcnow()
+    year = utc_now.strftime("%Y")
+    month = utc_now.strftime("%m")
+    day = utc_now.strftime("%d")
+
+    # Create path: output_folder/year/month/day
+    date_dir = os.path.join(output_folder, year, month, day)
+    os.makedirs(date_dir, exist_ok=True)
+
+    return date_dir
 
 
 # Connection status listener to monitor and debug connection issues
 class ConnectionStatusListener(ClientListener):
     def __init__(self, logs_dir):
         self.logs_dir = logs_dir
-        self.connection_log = os.path.join(logs_dir, "connection.log")
-        with open(self.connection_log, "w") as f:
+        # Will set the connection_log path dynamically in log_event
+        self.connection_log = None
+        # Initialize with a temporary log until we set up the dated directory
+        temp_log = os.path.join(logs_dir, "temp_connection.log")
+        with open(temp_log, "a") as f:  # Changed from 'w' to 'a'
             f.write(f"Connection log started at {get_log_timestamp()}\n")
             f.write("=" * 60 + "\n\n")
 
     def log_event(self, event_type, message):
         log_msg = f"{get_log_timestamp()} - {event_type}: {message}"
         print(f"[CONNECTION] {log_msg}")
+
+        # Get date directory and create connection log path
+        date_dir = get_date_directory()
+        self.connection_log = os.path.join(date_dir, "connection.log")
+
+        # Append to the connection log
         with open(self.connection_log, "a") as f:
             f.write(f"{log_msg}\n")
 
@@ -51,10 +89,16 @@ class ConnectionStatusListener(ClientListener):
 class TelemetryListener(SubscriptionListener):
     def __init__(self, logs_dir):
         self.logs_dir = logs_dir
+        self.output_dir = ensure_output_directory()
 
         # Add counter for updates
         self.update_count = 0
         self.last_update_time = datetime.datetime.now()
+        self.last_status_print = datetime.datetime.now()
+        # Print status every 60 seconds
+        self.status_interval = datetime.timedelta(seconds=60)
+        # Keep track of items updated since last status print
+        self.items_since_last_print = set()
 
     def onSubscription(self, subscription):
         message = f"Subscribed to telemetry items: {subscription.getItemNames()}"
@@ -69,17 +113,27 @@ class TelemetryListener(SubscriptionListener):
         timestamp = update.getValue("TimeStamp")
         value = update.getValue("Value")
 
-        # Update counter and time
+        # Update counter, time and item set
         self.update_count += 1
         self.last_update_time = datetime.datetime.now()
+        self.items_since_last_print.add(item_name)
 
-        # Print to console with timestamp and count
-        print(
-            f"[{get_log_timestamp()}] Update #{self.update_count} for {item_name}: TimeStamp={timestamp}, Value={value}"
-        )
+        # Only print periodic status updates to console
+        current_time = datetime.datetime.now()
+        if current_time - self.last_status_print >= self.status_interval:
+            unique_items = len(self.items_since_last_print)
+            print(
+                f"[{get_log_timestamp()}] Still recording: {self.update_count} total updates received "
+                f"({unique_items} unique items updated in the last minute)"
+            )
+            self.last_status_print = current_time
+            self.items_since_last_print = set()
 
-        # Append the update to a file (one file per item)
-        item_file = os.path.join(self.logs_dir, f"{item_name}.txt")
+        # Get date directory
+        date_dir = get_date_directory()
+
+        # Append the update to a file in the date-based directory
+        item_file = os.path.join(date_dir, f"{item_name}.txt")
         with open(item_file, "a") as f:
             f.write(f"{timestamp} {value}\n")
 
@@ -94,12 +148,15 @@ class TelemetryListener(SubscriptionListener):
         print(f"[{get_log_timestamp()}] ERROR: {message}")
 
 
-# Listener for time updates: computes a difference and writes a status line to AOS.txt.
+# Listener for time updates: computes a difference and writes a status line to AOS.log.
 class TimeListener(SubscriptionListener):
     def __init__(self, timestamp_now, logs_dir):
         self.timestamp_now = timestamp_now
         self.logs_dir = logs_dir
-        self.aos_file = os.path.join(logs_dir, "AOS.txt")
+        self.output_dir = ensure_output_directory()
+        # Will set the aos_file path dynamically in onItemUpdate
+        self.aos_file = None
+        self.current_date_dir = None
 
         # Store previous state to avoid repeated writes
         self.last_aosnum = None
@@ -108,14 +165,42 @@ class TimeListener(SubscriptionListener):
             minutes=5
         )  # Only force write every 5 minutes
 
-        # Create or clear the AOS file
-        with open(self.aos_file, "w") as f:
-            f.write(f"AOS Recording started at {get_log_timestamp()}\n")
-            f.write("=" * 40 + "\n\n")
+        # Replace detailed logging with simple metrics
+        self.update_count = 0
+        self.last_status_print = datetime.datetime.now()
+        self.status_interval = datetime.timedelta(seconds=60)  # Report once per minute
+        self.items_since_last_print = set()
+
+        # Add status tracking for AOS changes
+        self.current_status = None
+
+        # Create a temporary header - we'll move content to dated file in onItemUpdate
+        self.aos_header = (
+            f"AOS Recording started at {get_log_timestamp()}\n" + ("=" * 40) + "\n\n"
+        )
 
     def onItemUpdate(self, update):
         status = update.getValue("Status.Class")
         aos_timestamp_str = update.getValue("TimeStamp")
+
+        # Get date directory
+        date_dir = get_date_directory()
+
+        # Update the AOS file path if the date changed or not set yet
+        if self.current_date_dir != date_dir:
+            self.aos_file = os.path.join(date_dir, "AOS.log")
+            self.current_date_dir = date_dir
+
+            # Create or append to the AOS file exists with header
+            if not os.path.exists(self.aos_file):
+                with open(self.aos_file, "w") as f:
+                    f.write(self.aos_header)
+            # Add a restart marker if file exists
+            else:
+                with open(self.aos_file, "a") as f:
+                    f.write(f"\n{get_log_timestamp()} - AOS Recording restarted\n")
+                    f.write("-" * 40 + "\n")
+
         try:
             aos_timestamp = float(aos_timestamp_str)
         except ValueError:
@@ -127,6 +212,7 @@ class TimeListener(SubscriptionListener):
 
         difference = self.timestamp_now - aos_timestamp
 
+        # Determine status but don't log it immediately
         if status == "24":
             if difference > 0.00153680542553047:
                 message = "Stale Signal!"
@@ -138,17 +224,32 @@ class TimeListener(SubscriptionListener):
             message = "Signal Lost!"
             aosnum = 0
 
-        # Print to console with timestamp always
-        print(
-            f"[{get_log_timestamp()}] {message} (Status={status}, Diff={difference:.6f})"
-        )
+        # Log AOS changes to console when they happen
+        if aosnum != self.current_status:
+            print(
+                f"[{get_log_timestamp()}] AOS Change: {message} (Status={status}, Diff={difference:.6f})"
+            )
+            self.current_status = aosnum
 
-        # Only write to file if status changed or if we haven't written in a while
+        # Update counter and track item
+        self.update_count += 1
+        self.items_since_last_print.add("TIME_000001")
+
+        # Only print periodic status updates to console
         current_time = datetime.datetime.now()
+        if current_time - self.last_status_print >= self.status_interval:
+            print(
+                f"[{get_log_timestamp()}] Time updates: {self.update_count} updates received in the last minute"
+            )
+            self.update_count = 0
+            self.last_status_print = current_time
+            self.items_since_last_print = set()
+
+        # Only write to AOS file if status changed or if we haven't written in a while
         if (aosnum != self.last_aosnum) or (
             current_time - self.last_write_time > self.write_interval
         ):
-            # Append the AOS status update to AOS.txt
+            # Append the AOS status update to AOS.log
             with open(self.aos_file, "a") as f:
                 f.write(
                     f"AOS {aos_timestamp_str} {aosnum} - {get_log_timestamp()} - {message}\n"
@@ -200,12 +301,27 @@ def main():
     # Set up logs directory
     logs_dir = ensure_logs_directory()
     print(f"[{get_log_timestamp()}] Logging to directory: {os.path.abspath(logs_dir)}")
+    print(
+        f"[{get_log_timestamp()}] Telemetry data will be saved to: {os.path.abspath(output_folder)}"
+    )
 
-    # Create a master log file
-    master_log = os.path.join(logs_dir, "master.log")
-    with open(master_log, "w") as f:
-        f.write(f"ISS Telemetry Recording Session started at {get_log_timestamp()}\n")
-        f.write("=" * 60 + "\n\n")
+    # Get date directory for master log
+    date_dir = get_date_directory()
+
+    # Create a master log file in the dated directory - append if exists
+    master_log = os.path.join(date_dir, "master.log")
+    if os.path.exists(master_log):
+        with open(master_log, "a") as f:
+            f.write(
+                f"\nISS Telemetry Recording Session restarted at {get_log_timestamp()}\n"
+            )
+            f.write("-" * 60 + "\n\n")
+    else:
+        with open(master_log, "w") as f:
+            f.write(
+                f"ISS Telemetry Recording Session started at {get_log_timestamp()}\n"
+            )
+            f.write("=" * 60 + "\n\n")
 
     # Check network connectivity first - try both server domains
     print(f"[{get_log_timestamp()}] Checking network connectivity...")
@@ -331,6 +447,10 @@ def main():
                 full_subscription_done = True
                 print(f"[{get_log_timestamp()}] Subscribed to all telemetry items.")
 
+            # Update where we write to the master log, getting the current date-based directory
+            date_dir = get_date_directory()
+            master_log = os.path.join(date_dir, "master.log")
+
             if telemetry_listener.update_count == last_count:
                 no_data_count += 1
                 if no_data_count >= 6:  # No data for 60 seconds
@@ -365,7 +485,7 @@ def main():
                             print(
                                 f"[{get_log_timestamp()}] Max reconnection attempts reached. Please restart the script manually."
                             )
-                            with open(os.path.join(logs_dir, "master.log"), "a") as f:
+                            with open(master_log, "a") as f:
                                 f.write(
                                     f"{get_log_timestamp()} - Max reconnection attempts reached. Recording stopped.\n"
                                 )
@@ -380,17 +500,22 @@ def main():
                 current_time = get_log_timestamp()
                 status = f"[{current_time}] ISS telemetry recording active: {telemetry_listener.update_count} updates received."
                 print(status)
-                with open(os.path.join(logs_dir, "master.log"), "a") as f:
+                with open(master_log, "a") as f:
                     f.write(
                         f"{current_time} - Still recording - Updates: {telemetry_listener.update_count}\n"
                     )
 
     except KeyboardInterrupt:
         print(f"[{get_log_timestamp()}] Recording stopped by user.")
-        with open(os.path.join(logs_dir, "master.log"), "a") as f:
+
+        # Get current date directory for final log entry
+        date_dir = get_date_directory()
+        master_log = os.path.join(date_dir, "master.log")
+
+        with open(master_log, "a") as f:
             f.write(f"{get_log_timestamp()} - Recording stopped by user.\n")
             f.write(f"Total updates received: {telemetry_listener.update_count}\n")
-        print(f"All logs saved to: {os.path.abspath(logs_dir)}")
+        print(f"All logs saved to: {os.path.abspath(date_dir)}")
 
         # Proper cleanup
         client.disconnect()
