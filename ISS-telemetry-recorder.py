@@ -33,7 +33,7 @@ def ensure_output_directory():
 
 # Timestamp for log messages
 def get_log_timestamp():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
 # Helper function to get date-based directory path
@@ -122,12 +122,25 @@ class TelemetryListener(SubscriptionListener):
         current_time = datetime.datetime.now()
         if current_time - self.last_status_print >= self.status_interval:
             unique_items = len(self.items_since_last_print)
-            print(
-                f"[{get_log_timestamp()}] Still recording: {self.update_count} total updates received "
+            status_message = (
+                f"Still recording: {self.update_count} total updates received "
                 f"({unique_items} unique items updated in the last minute)"
             )
+            print(f"[{get_log_timestamp()}] {status_message}")
+
+            # Also write to master log
+            date_dir = get_date_directory()
+            master_log = os.path.join(date_dir, "master.log")
+            with open(master_log, "a") as f:
+                f.write(f"{get_log_timestamp()} - {status_message}\n")
+
             self.last_status_print = current_time
             self.items_since_last_print = set()
+
+        # Skip writing TIME_000001 data to disk as it's redundant (timestamped timestamps)
+        # and is already processed by the TimeListener class
+        if item_name == "TIME_000001":
+            return
 
         # Get date directory
         date_dir = get_date_directory()
@@ -174,11 +187,6 @@ class TimeListener(SubscriptionListener):
         # Add status tracking for AOS changes
         self.current_status = None
 
-        # Create a temporary header - we'll move content to dated file in onItemUpdate
-        self.aos_header = (
-            f"AOS Recording started at {get_log_timestamp()}\n" + ("=" * 40) + "\n\n"
-        )
-
     def onItemUpdate(self, update):
         status = update.getValue("Status.Class")
         aos_timestamp_str = update.getValue("TimeStamp")
@@ -190,16 +198,6 @@ class TimeListener(SubscriptionListener):
         if self.current_date_dir != date_dir:
             self.aos_file = os.path.join(date_dir, "AOS.log")
             self.current_date_dir = date_dir
-
-            # Create or append to the AOS file exists with header
-            if not os.path.exists(self.aos_file):
-                with open(self.aos_file, "w") as f:
-                    f.write(self.aos_header)
-            # Add a restart marker if file exists
-            else:
-                with open(self.aos_file, "a") as f:
-                    f.write(f"\n{get_log_timestamp()} - AOS Recording restarted\n")
-                    f.write("-" * 40 + "\n")
 
         try:
             aos_timestamp = float(aos_timestamp_str)
@@ -238,9 +236,9 @@ class TimeListener(SubscriptionListener):
         # Only print periodic status updates to console
         current_time = datetime.datetime.now()
         if current_time - self.last_status_print >= self.status_interval:
-            print(
-                f"[{get_log_timestamp()}] Time updates: {self.update_count} updates received in the last minute"
-            )
+            # print(
+            #     f"[{get_log_timestamp()}] Time updates: {self.update_count} updates received in the last minute"
+            # )
             self.update_count = 0
             self.last_status_print = current_time
             self.items_since_last_print = set()
@@ -251,9 +249,7 @@ class TimeListener(SubscriptionListener):
         ):
             # Append the AOS status update to AOS.log
             with open(self.aos_file, "a") as f:
-                f.write(
-                    f"AOS {aos_timestamp_str} {aosnum} - {get_log_timestamp()} - {message}\n"
-                )
+                f.write(f"AOS {aos_timestamp_str} {aosnum}\n")
             self.last_aosnum = aosnum
             self.last_write_time = current_time
 
@@ -374,22 +370,41 @@ def main():
         "CSASSRMS010",  # WR
     ]
 
-    # Create test subscription with simple format
-    test_subscription = Subscription(
-        "MERGE",
-        test_items,
-        ["TimeStamp", "Value"],
-    )
-    test_subscription.addListener(telemetry_listener)
+    # Function to create a fresh test subscription
+    def create_test_subscription():
+        sub = Subscription(
+            "MERGE",
+            test_items,
+            ["TimeStamp", "Value"],
+        )
+        sub.addListener(telemetry_listener)
+        return sub
 
-    # Time subscription - exactly as in the working example
-    time_subscription = Subscription(
-        "MERGE",
-        ["TIME_000001"],
-        ["TimeStamp", "Value", "Status.Class", "Status.Indicator"],
-    )
+    # Function to create a fresh time subscription
+    def create_time_subscription(timestamp_now):
+        sub = Subscription(
+            "MERGE",
+            ["TIME_000001"],
+            ["TimeStamp", "Value", "Status.Class", "Status.Indicator"],
+        )
+        sub.addListener(TimeListener(timestamp_now, logs_dir))
+        return sub
+
+    # Function to create a fresh telemetry subscription for all items
+    def create_telemetry_subscription():
+        sub = Subscription(
+            mode="MERGE",
+            items=items,
+            fields=["TimeStamp", "Value"],
+        )
+        sub.addListener(telemetry_listener)
+        return sub
+
+    # Create initial subscriptions
+    test_subscription = create_test_subscription()
     timestamp_now = compute_timestamp_now()
-    time_subscription.addListener(TimeListener(timestamp_now, logs_dir))
+    time_subscription = create_time_subscription(timestamp_now)
+    telemetry_subscription = None  # Will create later if needed
 
     # Connect first, then subscribe (like in working JS)
     print(f"[{get_log_timestamp()}] Connecting to Lightstreamer server...")
@@ -418,7 +433,7 @@ def main():
 
             # Log client status periodically for debugging
             status = client.getStatus()
-            print(f"[{get_log_timestamp()}] Client status: {status}")
+            # print(f"[{get_log_timestamp()}] Client status: {status}")
 
             # Check connection status explicitly - reconnect if not CONNECTED
             if not status.startswith("CONNECTED"):
@@ -436,14 +451,8 @@ def main():
                 )
 
                 # Now create and subscribe to the full item set
-                telemetry_sub = Subscription(
-                    mode="MERGE",
-                    items=items,
-                    fields=["TimeStamp", "Value"],
-                )
-                telemetry_sub.addListener(telemetry_listener)
-
-                client.subscribe(telemetry_sub)
+                telemetry_subscription = create_telemetry_subscription()
+                client.subscribe(telemetry_subscription)
                 full_subscription_done = True
                 print(f"[{get_log_timestamp()}] Subscribed to all telemetry items.")
 
@@ -471,6 +480,16 @@ def main():
                             client.connect()
                             time.sleep(5)  # Give more time to establish connection
 
+                            # Create fresh subscription objects for reconnection
+                            print(
+                                f"[{get_log_timestamp()}] Creating fresh subscriptions..."
+                            )
+                            test_subscription = create_test_subscription()
+                            timestamp_now = (
+                                compute_timestamp_now()
+                            )  # Recalculate timestamp
+                            time_subscription = create_time_subscription(timestamp_now)
+
                             # Resubscribe to test items first
                             print(
                                 f"[{get_log_timestamp()}] Resubscribing to test items..."
@@ -479,7 +498,7 @@ def main():
                             time.sleep(1)
                             client.subscribe(time_subscription)
 
-                            # Reset full subscription flag
+                            # Reset full subscription flag to resubscribe to all items once test items work
                             full_subscription_done = False
                         else:
                             print(
@@ -495,15 +514,6 @@ def main():
                 no_data_count = 0
                 reconnect_attempts = 0
                 last_count = telemetry_listener.update_count
-
-                # Log status with update count
-                current_time = get_log_timestamp()
-                status = f"[{current_time}] ISS telemetry recording active: {telemetry_listener.update_count} updates received."
-                print(status)
-                with open(master_log, "a") as f:
-                    f.write(
-                        f"{current_time} - Still recording - Updates: {telemetry_listener.update_count}\n"
-                    )
 
     except KeyboardInterrupt:
         print(f"[{get_log_timestamp()}] Recording stopped by user.")
