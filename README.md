@@ -7,7 +7,8 @@ This application records telemetry data from the International Space Station (IS
 ### Pull the image from GitHub Container Registry
 
 ```bash
-docker pull ghcr.io/bfeist/iss-telemetry-recorder:latest
+# changed: update tag to 'main'
+docker pull ghcr.io/bfeist/iss-telemetry-recorder:main
 ```
 
 ### Run with Docker
