@@ -9,7 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application structure
 COPY src/ /app/src/
-COPY .env /app/
 
 # Copy entry point script
 COPY docker/entrypoint.sh /app/
