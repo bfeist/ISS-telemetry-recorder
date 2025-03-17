@@ -1,0 +1,28 @@
+version: "3"
+
+services:
+  iss-telemetry:
+    build:
+      context: .
+      dockerfile: docker/dockerfile
+    container_name: iss-telemetry-recorder
+    restart: always
+    volumes:
+      - ${HOST_RAW_FOLDER}:/data
+    environment:
+      - RAW_FOLDER=/data # this replaces the .env in the py script when running in docker
+    # Run with tty enabled to see real-time console output
+    tty: true
+    stdin_open: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # Healthcheck to monitor the application
+    healthcheck:
+      test: ["CMD", "python", "/app/src/healthcheck.py"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 30s

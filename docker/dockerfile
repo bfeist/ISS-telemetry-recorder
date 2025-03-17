@@ -1,0 +1,29 @@
+FROM python:3.9-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install dependencies (including psutil for process monitoring)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the application structure
+COPY src/ /app/src/
+COPY .env /app/
+
+# Copy entry point script
+COPY docker/entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+
+# Create directory for logs
+RUN mkdir -p /data/iss_telemetry
+
+# Environment variables (with default values that can be overridden)
+ENV RAW_FOLDER=/data
+ENV PYTHONUNBUFFERED=1
+
+# Volume for persistent data storage
+VOLUME /data
+
+# Use entrypoint script to properly handle signals
+ENTRYPOINT ["/app/entrypoint.sh"]
