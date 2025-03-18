@@ -177,6 +177,8 @@ class TelemetryListener(SubscriptionListener):
         self.status_interval = datetime.timedelta(seconds=60)
         # Keep track of items updated since last status print
         self.items_since_last_print = set()
+        # New: Dictionary to store the last written (timestamp, value) per item to avoid duplicates
+        self.last_written = {}
 
     def onSubscription(self, subscription):
         message = f"Subscribed to telemetry items: {subscription.getItemNames()}"
@@ -191,6 +193,13 @@ class TelemetryListener(SubscriptionListener):
             item_name = update.getItemName()
             timestamp = update.getValue("TimeStamp")
             value = update.getValue("Value")
+
+            # Skip duplicate updates (for items except TIME_000001)
+            if item_name != "TIME_000001":
+                last = self.last_written.get(item_name)
+                if last == (timestamp, value):
+                    return  # duplicate detected, skip writing
+                self.last_written[item_name] = (timestamp, value)
 
             # Update counter, time and item set
             self.update_count += 1
