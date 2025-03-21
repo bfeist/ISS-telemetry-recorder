@@ -639,27 +639,6 @@ def main():
     # Create a telemetry listener with the logs directory
     telemetry_listener = TelemetryListener(logs_dir)
 
-    # Test items
-    test_items = [
-        "CSASSRMS004",  # SR
-        "CSASSRMS005",  # SY
-        "CSASSRMS006",  # SP
-        "CSASSRMS007",  # EP
-        "CSASSRMS008",  # WP
-        "CSASSRMS009",  # WY
-        "CSASSRMS010",  # WR
-    ]
-
-    # Function to create a fresh test subscription
-    def create_test_subscription():
-        sub = Subscription(
-            "MERGE",
-            test_items,
-            ["TimeStamp", "Value"],
-        )
-        sub.addListener(telemetry_listener)
-        return sub
-
     # Function to create a fresh time subscription
     def create_time_subscription(timestamp_now):
         sub = Subscription(
@@ -681,12 +660,11 @@ def main():
         return sub
 
     # Create initial subscriptions
-    test_subscription = create_test_subscription()
     timestamp_now = compute_timestamp_now()
     time_subscription = create_time_subscription(timestamp_now)
-    telemetry_subscription = None  # Will create later if needed
+    telemetry_subscription = create_telemetry_subscription()
 
-    # Connect first, then subscribe (like in working JS)
+    # Connect first, then subscribe
     print(f"[{get_log_timestamp()}] Connecting to Lightstreamer server...")
     sys.stdout.flush()
     client.connect()
@@ -694,12 +672,15 @@ def main():
     # Wait a bit for connection
     time.sleep(3)
 
-    print(f"[{get_log_timestamp()}] Subscribing to test items...")
-    sys.stdout.flush()
-    client.subscribe(test_subscription)
     print(f"[{get_log_timestamp()}] Subscribing to TIME_000001...")
     sys.stdout.flush()
     client.subscribe(time_subscription)
+
+    print(f"[{get_log_timestamp()}] Subscribing to all telemetry items...")
+    sys.stdout.flush()
+    client.subscribe(telemetry_subscription)
+    print(f"[{get_log_timestamp()}] Subscribed to all telemetry items.")
+    sys.stdout.flush()
 
     # Add memory monitor
     memory_monitor = MemoryMonitor(log_interval=300)  # Log every 5 minutes
@@ -715,9 +696,6 @@ def main():
         max_reconnect_attempts = 30 if os.path.exists("/.dockerenv") else 10
         reconnect_attempts = 0
         health_check_interval = 0
-
-        # Only subscribe to all items if we start receiving data from test items
-        full_subscription_done = False
 
         while True:
             # Pet the watchdog to show the main loop is still running
@@ -763,26 +741,6 @@ def main():
                 time.sleep(3)  # Give it time to connect
                 continue
 
-            # Check if we're getting updates
-            if telemetry_listener.update_count > 0 and not full_subscription_done:
-                print(
-                    f"[{get_log_timestamp()}] Test subscription successful! Subscribing to all items..."
-                )
-                sys.stdout.flush()
-
-                # Now create and subscribe to the full item set
-                try:
-                    telemetry_subscription = create_telemetry_subscription()
-                    client.subscribe(telemetry_subscription)
-                    full_subscription_done = True
-                    print(f"[{get_log_timestamp()}] Subscribed to all telemetry items.")
-                    sys.stdout.flush()
-                except Exception as e:
-                    print(
-                        f"[{get_log_timestamp()}] Error subscribing to all items: {str(e)}"
-                    )
-                    sys.stdout.flush()
-
             # Update where we write to the master log, getting the current date-based directory
             date_dir = get_date_directory()
             master_log = os.path.join(date_dir, "master.log")
@@ -805,15 +763,8 @@ def main():
 
                             try:
                                 # Clean up old subscriptions explicitly before creating new ones
-                                if telemetry_subscription:
-                                    try:
-                                        client.unsubscribe(telemetry_subscription)
-                                        telemetry_subscription = None
-                                    except:
-                                        pass
-
                                 try:
-                                    client.unsubscribe(test_subscription)
+                                    client.unsubscribe(telemetry_subscription)
                                 except:
                                     pass
 
@@ -836,25 +787,26 @@ def main():
                                     f"[{get_log_timestamp()}] Creating fresh subscriptions..."
                                 )
                                 sys.stdout.flush()
-                                test_subscription = create_test_subscription()
                                 timestamp_now = (
                                     compute_timestamp_now()
                                 )  # Recalculate timestamp
                                 time_subscription = create_time_subscription(
                                     timestamp_now
                                 )
+                                telemetry_subscription = create_telemetry_subscription()
 
-                                # Resubscribe to test items first
+                                # Resubscribe to all items
                                 print(
-                                    f"[{get_log_timestamp()}] Resubscribing to test items..."
+                                    f"[{get_log_timestamp()}] Resubscribing to TIME_000001..."
                                 )
                                 sys.stdout.flush()
-                                client.subscribe(test_subscription)
-                                time.sleep(1)
                                 client.subscribe(time_subscription)
 
-                                # Reset full subscription flag to resubscribe to all items once test items work
-                                full_subscription_done = False
+                                print(
+                                    f"[{get_log_timestamp()}] Resubscribing to all telemetry items..."
+                                )
+                                sys.stdout.flush()
+                                client.subscribe(telemetry_subscription)
                             except Exception as e:
                                 print(
                                     f"[{get_log_timestamp()}] Error during reconnection: {str(e)}"
