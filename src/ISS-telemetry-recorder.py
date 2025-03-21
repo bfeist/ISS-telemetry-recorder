@@ -5,6 +5,8 @@ import sys
 import signal
 import traceback
 import threading
+import gc  # Add garbage collection module
+import psutil  # Add for memory monitoring
 from lightstreamer.client import LightstreamerClient, Subscription, SubscriptionListener
 
 from lightstreamer.client import (
@@ -467,6 +469,64 @@ def signal_handler(sig, frame):
     )  # Use os._exit instead of sys.exit to ensure immediate exit without threading issues
 
 
+# Add memory monitor class
+class MemoryMonitor:
+    def __init__(self, log_interval=600):  # 10 minutes by default
+        self.log_interval = log_interval
+        self.last_log_time = time.time()
+        self.peak_memory = 0
+        self.start_memory = self.get_current_memory()
+
+    def get_current_memory(self):
+        """Get current memory usage in MB"""
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        return memory_info.rss / (1024 * 1024)  # Convert to MB
+
+    def check_and_log(self):
+        """Check current memory usage and log if needed"""
+        current_time = time.time()
+        if current_time - self.last_log_time >= self.log_interval:
+            current_memory = self.get_current_memory()
+            self.peak_memory = max(self.peak_memory, current_memory)
+
+            print(
+                f"[{get_log_timestamp()}] Memory usage: {current_memory:.2f} MB (Peak: {self.peak_memory:.2f} MB)"
+            )
+
+            # Log to master log as well
+            try:
+                date_dir = get_date_directory()
+                master_log = os.path.join(date_dir, "master.log")
+                with open(master_log, "a") as f:
+                    f.write(
+                        f"{get_log_timestamp()} - Memory usage: {current_memory:.2f} MB (Peak: {self.peak_memory:.2f} MB)\n"
+                    )
+            except Exception as e:
+                print(
+                    f"[{get_log_timestamp()}] ERROR: Could not write memory stats to master log: {e}"
+                )
+
+            self.last_log_time = current_time
+
+            # Try to run garbage collection if memory has grown significantly
+            if current_memory > self.start_memory * 1.5:  # If memory grew by 50%
+                self.force_garbage_collection()
+
+    def force_garbage_collection(self):
+        """Force Python garbage collection"""
+        print(f"[{get_log_timestamp()}] Running garbage collection...")
+        before_memory = self.get_current_memory()
+
+        # Run garbage collection
+        gc.collect()
+
+        after_memory = self.get_current_memory()
+        print(
+            f"[{get_log_timestamp()}] Garbage collection complete. Memory before: {before_memory:.2f} MB, after: {after_memory:.2f} MB"
+        )
+
+
 def main():
     # Register signal handlers - important for Docker container operation
     signal.signal(signal.SIGINT, signal_handler)
@@ -641,6 +701,12 @@ def main():
     sys.stdout.flush()
     client.subscribe(time_subscription)
 
+    # Add memory monitor
+    memory_monitor = MemoryMonitor(log_interval=300)  # Log every 5 minutes
+    print(
+        f"[{get_log_timestamp()}] Initial memory usage: {memory_monitor.get_current_memory():.2f} MB"
+    )
+
     # Keep the script running with improved reconnection logic
     try:
         no_data_count = 0
@@ -659,6 +725,9 @@ def main():
                 sys.watchdog.pet()
 
             time.sleep(10)  # Check every 10 seconds
+
+            # Check memory usage
+            memory_monitor.check_and_log()
 
             # Increment health check interval counter
             health_check_interval += 1
@@ -735,6 +804,27 @@ def main():
                             sys.stdout.flush()
 
                             try:
+                                # Clean up old subscriptions explicitly before creating new ones
+                                if telemetry_subscription:
+                                    try:
+                                        client.unsubscribe(telemetry_subscription)
+                                        telemetry_subscription = None
+                                    except:
+                                        pass
+
+                                try:
+                                    client.unsubscribe(test_subscription)
+                                except:
+                                    pass
+
+                                try:
+                                    client.unsubscribe(time_subscription)
+                                except:
+                                    pass
+
+                                # Force garbage collection after unsubscribing
+                                gc.collect()
+
                                 # Simplified reconnection process matching JS better
                                 client.disconnect()
                                 time.sleep(3)
