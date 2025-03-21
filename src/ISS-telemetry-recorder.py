@@ -462,7 +462,9 @@ def signal_handler(sig, frame):
     # Clean exit
     print(f"[{get_log_timestamp()}] Exiting with status 0.")
     sys.stdout.flush()
-    sys.exit(0)
+    os._exit(
+        0
+    )  # Use os._exit instead of sys.exit to ensure immediate exit without threading issues
 
 
 def main():
@@ -474,11 +476,13 @@ def main():
     if os.path.exists("/.dockerenv"):
         print(f"[{get_log_timestamp()}] Running in Docker container")
         print(f"[{get_log_timestamp()}] RAW_FOLDER set to: {RAW_FOLDER}")
+        print(f"[{get_log_timestamp()}] Process ID: {os.getpid()}")
 
         # Create a .ready file for the healthcheck script
         try:
             with open(os.path.join(RAW_FOLDER, ".ready"), "w") as f:
                 f.write(f"Process started at {get_log_timestamp()}\n")
+                f.write(f"PID: {os.getpid()}\n")
         except Exception as e:
             print(f"[{get_log_timestamp()}] Warning: Could not create ready file: {e}")
 
@@ -848,7 +852,20 @@ def main():
 
             if hasattr(sys, "watchdog"):
                 sys.watchdog.stop()
-        except:
+
+            # In finally block, remove ready file if exiting
+            if os.path.exists("/.dockerenv"):
+                ready_file = os.path.join(RAW_FOLDER, ".ready")
+                if os.path.exists(ready_file):
+                    try:
+                        os.remove(ready_file)
+                        print(f"[{get_log_timestamp()}] Removed ready file")
+                    except Exception as e:
+                        print(
+                            f"[{get_log_timestamp()}] Failed to remove ready file: {e}"
+                        )
+        except Exception as e:
+            print(f"[{get_log_timestamp()}] Error in cleanup: {e}")
             pass
 
 

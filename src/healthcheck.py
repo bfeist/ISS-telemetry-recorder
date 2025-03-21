@@ -4,6 +4,7 @@ import sys
 import time
 import datetime
 import glob
+import subprocess
 
 
 def get_log_timestamp():
@@ -11,6 +12,38 @@ def get_log_timestamp():
 
 
 def main():
+    # Check if the .ready file exists and is recent
+    ready_file = "/data/.ready"
+    if os.path.exists(ready_file):
+        mod_time = os.path.getmtime(ready_file)
+        if time.time() - mod_time < 600:  # 10 minutes
+            print(f"[{get_log_timestamp()}] Ready file is recent, process is alive")
+            sys.exit(0)
+        else:
+            print(f"[{get_log_timestamp()}] Ready file is too old")
+    else:
+        print(f"[{get_log_timestamp()}] Ready file does not exist")
+
+    # Check if the Python process is running
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "python.*ISS-telemetry-recorder.py"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(
+                f"[{get_log_timestamp()}] Process is running: {result.stdout.strip()}"
+            )
+            # Create/update the ready file since the process is running
+            with open(ready_file, "w") as f:
+                f.write(f"Process running at {get_log_timestamp()}\n")
+            sys.exit(0)
+        else:
+            print(f"[{get_log_timestamp()}] Process not found: {result.stderr.strip()}")
+    except Exception as e:
+        print(f"[{get_log_timestamp()}] Error checking process: {e}")
+
     # Check if the data directory exists
     data_dir = "/data/iss_telemetry"
     if not os.path.exists(data_dir):
