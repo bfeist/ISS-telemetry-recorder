@@ -14,6 +14,7 @@ from lightstreamer.client import (
 )
 
 from dotenv import load_dotenv
+from connection_retry import record_forever
 
 # Force stdout to be line-buffered for more reliable console output
 (
@@ -182,12 +183,12 @@ class TelemetryListener(SubscriptionListener):
         # New: Dictionary to store the last written (timestamp, value) per item to avoid duplicates
         self.last_written = {}
 
-    def onSubscription(self, subscription):
-        message = f"Subscribed to telemetry items: {subscription.getItemNames()}"
+    def onSubscription(self):
+        message = "Telemetry subscription accepted"
         print(f"[{get_log_timestamp()}] {message}")
 
-    def onUnsubscription(self, subscription):
-        message = f"Unsubscribed from telemetry items: {subscription.getItemNames()}"
+    def onUnsubscription(self):
+        message = "Telemetry subscription ended"
         print(f"[{get_log_timestamp()}] {message}")
 
     def onItemUpdate(self, update):
@@ -411,34 +412,6 @@ def compute_timestamp_now():
     return timestamp_now
 
 
-def check_network_connectivity(host="push.lightstreamer.com"):
-    """Check if we can connect to the specified host"""
-    import socket
-    import ssl
-
-    try:
-        # First try standard connection
-        print(f"[{get_log_timestamp()}] Testing connection to {host}...")
-        socket.create_connection((host, 443), timeout=5)
-        return True
-    except OSError as e:
-        print(f"[{get_log_timestamp()}] Standard connection failed: {e}")
-        try:
-            # Try SSL connection
-            print(f"[{get_log_timestamp()}] Trying SSL connection to {host}...")
-            context = ssl.create_default_context()
-            with socket.create_connection((host, 443), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=host) as ssock:
-                    print(
-                        f"[{get_log_timestamp()}] SSL connection successful to {host}"
-                    )
-                    return True
-        except Exception as e:
-            print(f"[{get_log_timestamp()}] SSL connection failed: {e}")
-            return False
-    sys.stdout.flush()  # Ensure output is displayed
-
-
 # Add signal handler for graceful shutdown
 # Enhanced for Docker environment
 def signal_handler(sig, frame):
@@ -579,40 +552,6 @@ def main():
             )
             f.write("=" * 60 + "\n\n")
 
-    # Check network connectivity first - try both server domains
-    print(f"[{get_log_timestamp()}] Checking network connectivity...")
-    sys.stdout.flush()
-
-    server_url = "https://push.lightstreamer.com"
-
-    # In Docker, we want to retry network connectivity checks
-    max_network_retries = 12  # Retry for 12 * 10 seconds = 2 minutes
-    network_retry_count = 0
-
-    while network_retry_count < max_network_retries:
-        if check_network_connectivity("push.lightstreamer.com"):
-            print(f"[{get_log_timestamp()}] Using server: {server_url}")
-            break
-        else:
-            network_retry_count += 1
-            if network_retry_count < max_network_retries:
-                print(
-                    f"[{get_log_timestamp()}] Network connection failed. Retrying in 10 seconds... ({network_retry_count}/{max_network_retries})"
-                )
-                time.sleep(10)
-            else:
-                error_msg = "Cannot connect to Lightstreamer server after multiple attempts. Will continue and hope for network recovery."
-                print(f"[{get_log_timestamp()}] WARNING: {error_msg}")
-                sys.stdout.flush()
-                with open(os.path.join(date_dir, "master.log"), "a") as f:
-                    f.write(f"{get_log_timestamp()} - WARNING: {error_msg}\n")
-                # In Docker, we don't exit - the container will restart and we'll try again
-                if not os.path.exists("/.dockerenv"):
-                    sys.exit(1)
-
-    print(f"[{get_log_timestamp()}] Network connectivity confirmed.")
-    sys.stdout.flush()
-
     # Create a simpler client matching the working JavaScript version
     client = LightstreamerClient("https://push.lightstreamer.com", "ISSLIVE")
 
@@ -664,23 +603,10 @@ def main():
     time_subscription = create_time_subscription(timestamp_now)
     telemetry_subscription = create_telemetry_subscription()
 
-    # Connect first, then subscribe
-    print(f"[{get_log_timestamp()}] Connecting to Lightstreamer server...")
-    sys.stdout.flush()
-    client.connect()
-
-    # Wait a bit for connection
-    time.sleep(3)
-
-    print(f"[{get_log_timestamp()}] Subscribing to TIME_000001...")
-    sys.stdout.flush()
+    # Register subscriptions before connecting. The SDK retains and resubscribes
+    # them on every new session, even if the server is unavailable at startup.
     client.subscribe(time_subscription)
-
-    print(f"[{get_log_timestamp()}] Subscribing to all telemetry items...")
-    sys.stdout.flush()
     client.subscribe(telemetry_subscription)
-    print(f"[{get_log_timestamp()}] Subscribed to all telemetry items.")
-    sys.stdout.flush()
 
     # Add memory monitor
     memory_monitor = MemoryMonitor(log_interval=300)  # Log every 5 minutes
@@ -688,157 +614,21 @@ def main():
         f"[{get_log_timestamp()}] Initial memory usage: {memory_monitor.get_current_memory():.2f} MB"
     )
 
-    # Keep the script running with improved reconnection logic
+    def heartbeat():
+        if hasattr(sys, "watchdog"):
+            sys.watchdog.pet()
+        memory_monitor.check_and_log()
+        if os.path.exists("/.dockerenv"):
+            # Liveness is independent of upstream telemetry availability.
+            # Overwrite instead of appending forever during long deployments.
+            with open(os.path.join(RAW_FOLDER, ".ready"), "w") as f:
+                f.write(f"Recorder alive at {get_log_timestamp()}\n")
+
     try:
-        no_data_count = 0
-        last_count = 0
-        # Increase max_reconnect_attempts for Docker environment to be more resilient
-        max_reconnect_attempts = 30 if os.path.exists("/.dockerenv") else 10
-        reconnect_attempts = 0
-        health_check_interval = 0
-
-        while True:
-            # Pet the watchdog to show the main loop is still running
-            if hasattr(sys, "watchdog"):
-                sys.watchdog.pet()
-
-            time.sleep(10)  # Check every 10 seconds
-
-            # Check memory usage
-            memory_monitor.check_and_log()
-
-            # Increment health check interval counter
-            health_check_interval += 1
-
-            # Every 30 iterations (5 minutes), update .ready file if running in Docker
-            if health_check_interval >= 30:
-                health_check_interval = 0
-                if os.path.exists("/.dockerenv"):
-                    try:
-                        ready_file = os.path.join(RAW_FOLDER, ".ready")
-                        with open(ready_file, "a") as f:
-                            f.write(f"Still alive at {get_log_timestamp()}\n")
-                    except Exception as e:
-                        print(
-                            f"[{get_log_timestamp()}] Warning: Could not update ready file: {e}"
-                        )
-
-            # Log client status periodically for debugging
-            status = client.getStatus()
-            # print(f"[{get_log_timestamp()}] Client status: {status}")
-
-            # Check connection status explicitly - reconnect if not CONNECTED
-            if not status.startswith("CONNECTED"):
-                print(
-                    f"[{get_log_timestamp()}] Not connected (status: {status}). Attempting to reconnect..."
-                )
-                sys.stdout.flush()
-                try:
-                    client.connect()
-                except Exception as e:
-                    print(f"[{get_log_timestamp()}] Error during reconnect: {str(e)}")
-                    sys.stdout.flush()
-                time.sleep(3)  # Give it time to connect
-                continue
-
-            # Update where we write to the master log, getting the current date-based directory
-            date_dir = get_date_directory()
-            master_log = os.path.join(date_dir, "master.log")
-
-            if telemetry_listener.update_count == last_count:
-                no_data_count += 1
-                if no_data_count >= 6:  # No data for 60 seconds
-                    print(
-                        f"[{get_log_timestamp()}] WARNING: No updates received in the last 60 seconds."
-                    )
-                    sys.stdout.flush()
-
-                    if no_data_count == 6 or no_data_count % 18 == 0:
-                        if reconnect_attempts < max_reconnect_attempts:
-                            reconnect_attempts += 1
-                            print(
-                                f"[{get_log_timestamp()}] Attempting to reconnect... (Attempt {reconnect_attempts}/{max_reconnect_attempts})"
-                            )
-                            sys.stdout.flush()
-
-                            try:
-                                # Clean up old subscriptions explicitly before creating new ones
-                                try:
-                                    client.unsubscribe(telemetry_subscription)
-                                except:
-                                    pass
-
-                                try:
-                                    client.unsubscribe(time_subscription)
-                                except:
-                                    pass
-
-                                # Force garbage collection after unsubscribing
-                                gc.collect()
-
-                                # Simplified reconnection process matching JS better
-                                client.disconnect()
-                                time.sleep(3)
-                                client.connect()
-                                time.sleep(5)  # Give more time to establish connection
-
-                                # Create fresh subscription objects for reconnection
-                                print(
-                                    f"[{get_log_timestamp()}] Creating fresh subscriptions..."
-                                )
-                                sys.stdout.flush()
-                                timestamp_now = (
-                                    compute_timestamp_now()
-                                )  # Recalculate timestamp
-                                time_subscription = create_time_subscription(
-                                    timestamp_now
-                                )
-                                telemetry_subscription = create_telemetry_subscription()
-
-                                # Resubscribe to all items
-                                print(
-                                    f"[{get_log_timestamp()}] Resubscribing to TIME_000001..."
-                                )
-                                sys.stdout.flush()
-                                client.subscribe(time_subscription)
-
-                                print(
-                                    f"[{get_log_timestamp()}] Resubscribing to all telemetry items..."
-                                )
-                                sys.stdout.flush()
-                                client.subscribe(telemetry_subscription)
-                            except Exception as e:
-                                print(
-                                    f"[{get_log_timestamp()}] Error during reconnection: {str(e)}"
-                                )
-                                sys.stdout.flush()
-                        else:
-                            print(
-                                f"[{get_log_timestamp()}] Max reconnection attempts reached."
-                            )
-                            sys.stdout.flush()
-                            with open(master_log, "a") as f:
-                                f.write(
-                                    f"{get_log_timestamp()} - Max reconnection attempts reached.\n"
-                                )
-
-                            if os.path.exists("/.dockerenv"):
-                                print(
-                                    f"[{get_log_timestamp()}] In Docker container - exiting with error code to trigger container restart"
-                                )
-                                sys.exit(
-                                    1
-                                )  # Exit with error so Docker will restart the container
-                            else:
-                                print(
-                                    f"[{get_log_timestamp()}] Please restart the script manually."
-                                )
-                                break
-            else:
-                # We got data, reset the counters
-                no_data_count = 0
-                reconnect_attempts = 0
-                last_count = telemetry_listener.update_count
+        record_forever(
+            client, telemetry_listener, heartbeat,
+            lambda message: print(f"[{get_log_timestamp()}] {message}", flush=True),
+        )
 
     except KeyboardInterrupt:
         print(f"[{get_log_timestamp()}] Recording stopped by user.")

@@ -29,5 +29,9 @@ ENV PYTHONUNBUFFERED=1
 # Volume for persistent data storage
 VOLUME /data
 
+# A silent upstream is not a failed recorder. Check the main loop heartbeat.
+HEALTHCHECK --interval=1m --timeout=10s --start-period=30s --retries=3 \
+    CMD ["python", "/app/src/healthcheck.py"]
+
 # Use entrypoint script to properly handle signals
 ENTRYPOINT ["/app/entrypoint.sh"]

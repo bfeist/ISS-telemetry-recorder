@@ -16,8 +16,9 @@ docker pull ghcr.io/bfeist/iss-telemetry-recorder:main
 ```bash
 docker run -d \
   --name iss-telemetry \
+  --restart unless-stopped \
   -v /path/on/host:/data \
-  ghcr.io/bfeist/iss-telemetry-recorder:latest
+  ghcr.io/bfeist/iss-telemetry-recorder:main
 ```
 
 ### Run with Docker Compose
@@ -29,7 +30,7 @@ version: "3"
 
 services:
   iss-telemetry:
-    image: ghcr.io/bfeist/iss-telemetry-recorder:latest
+    image: ghcr.io/bfeist/iss-telemetry-recorder:main
     container_name: iss-telemetry-recorder
     restart: unless-stopped
     volumes:
@@ -60,5 +61,22 @@ cd ISS-telemetry-recorder
 docker build -t iss-telemetry-recorder -f docker/dockerfile .
 
 # Run the Docker container
-docker run -d --name iss-telemetry -v ./data:/data iss-telemetry-recorder
+docker run -d --name iss-telemetry --restart unless-stopped -v ./data:/data iss-telemetry-recorder
 ```
+
+## Outage recovery
+
+The recorder retries indefinitely when the server is unreachable or connected
+but sends no telemetry for 60 seconds. Recovery attempts back off from 30 seconds
+to at most 5 minutes, and the delay resets when updates resume. Subscriptions are
+retained across reconnects. Stopping the container still stops the recorder.
+
+The image healthcheck checks the recorder's main loop heartbeat, independently
+of upstream data availability. A healthy container may be waiting for telemetry;
+its logs show reconnect attempts and when telemetry resumes.
+
+In Unraid, enable **Autostart** and set **Extra Parameters** (Advanced View) to
+`--restart=unless-stopped`. Autostart alone does not restart a crashed container.
+Saving the restart policy in the template preserves it across image updates.
+
+Run the outage regression tests with `python -m unittest discover -s tests -v`.
